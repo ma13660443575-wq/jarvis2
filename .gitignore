@@ -1,0 +1,50 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python environments and caches
+.venv/
+.venv_old/
+.uv-cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# JavaScript dependencies and generated frontend output
+node_modules/
+frontend/dist/
+
+# Local application data and user knowledge
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local speech/ML model files
+models/
+
+# Desktop build artifacts and packaged binaries
+build/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/assets/icon-src.png
+*.exe
+*.msi
+*.dmg
+*.app
+*.pkg
+*.zip
+*.7z
+*.rar
+
+# Logs and local tooling files
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

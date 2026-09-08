@@ -1,0 +1,21 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+jieba>=0.42
+openai>=1.30
+apscheduler>=3.10
+requests
+PyYAML
+qdrant-client>=1.9
+fastembed>=0.3
+langgraph>=0.2
+langchain-core>=0.3
+pytest
+websockets>=12.0
+python-multipart>=0.0.9
+edge-tts>=6.1.9
+# Windows UI Automation（可选观察桥；缺失时仍可读取基础活动窗口元数据）
+uiautomation>=2.0.29,<3.0
+# 本地语音：sherpa-onnx 离线 ASR/唤醒 + sounddevice 麦克风（numpy 为两者依赖）
+sherpa-onnx>=1.10
+sounddevice>=0.4.6
+numpy>=1.24

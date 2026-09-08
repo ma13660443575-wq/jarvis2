@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JARVIS</title>
+  <link rel="stylesheet" href="./pet.css" />
+</head>
+<body>
+  <div id="stage">
+    <!-- 说话气泡 -->
+    <div id="bubble" class="hidden"><span id="bubble-text"></span></div>
+
+    <!-- 精灵（分件：身体 + 头部，头嵌在身体坐标系内）+ 辉光 -->
+    <div id="glow" class="idle">
+      <div id="rig">
+        <div id="body">
+          <img src="./pet_body.png" alt="JARVIS" draggable="false" />
+          <img id="head" src="./pet_head.png" alt="" draggable="false" />
+        </div>
+      </div>
+      <div id="halo"></div>
+    </div>
+
+    <!-- 右键菜单 -->
+    <div id="ctx" class="hidden">
+      <button data-act="open_hud">打开 HUD</button>
+      <button data-act="quit">退出 JARVIS</button>
+    </div>
+  </div>
+
+  <script src="./main.js"></script>
+</body>
+</html>

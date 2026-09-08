@@ -1,0 +1,247 @@
+/* pet.css — JARVIS2 透明桌宠页样式 */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: grab;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+body.dragging {
+  cursor: grabbing;
+}
+
+#stage {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* ---------- 精灵 + 辉光 ---------- */
+
+#glow {
+  position: absolute;
+  left: 50%;
+  bottom: 11px;
+  transform: translateX(-50%);
+  transform-origin: 50% 100%;
+  width: 70px;
+  height: 130px;
+  animation: float 3s ease-in-out infinite alternate;
+  will-change: transform;
+  perspective: 320px;               /* 全身 3D 透视（分件转向） */
+}
+
+/* 待机：缓慢上下浮动 + 轻微呼吸放大 */
+@keyframes float {
+  from {
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+  to {
+    transform: translateX(-50%) translateY(-6px) scale(1.02);
+  }
+}
+
+/* 说话中：更快更明显的律动 */
+#glow.speaking {
+  animation: speak 0.55s ease-in-out infinite alternate;
+}
+
+@keyframes speak {
+  from {
+    transform: translateX(-50%) translateY(-2px) scale(1);
+  }
+  to {
+    transform: translateX(-50%) translateY(-7px) scale(1.035);
+  }
+}
+
+/* 分件 3D 骨架：身体容器（肩甲/胸甲）+ 头部（颈部关节），见 split_pet.py */
+#rig {
+  position: absolute;
+  inset: 0;
+  transform-style: preserve-3d;
+}
+
+#body {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 70px;
+  height: 130px;
+  -webkit-user-drag: none;
+  user-select: none;
+  pointer-events: auto;
+  transform-origin: 50% 100%;       /* 以底为轴：全身朝向光标 */
+  transform-style: preserve-3d;     /* 头部嵌在身体坐标系内，随身体整体转向 */
+  transition: transform 0.18s ease-out;
+  will-change: transform;
+}
+
+/* 肩甲/胸甲层铺满身体容器 */
+#body > img:not(#head) {
+  display: block;
+  width: 100%;
+  height: 100%;
+  -webkit-user-drag: none;
+  user-select: none;
+}
+
+#head {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 70px;
+  height: 57px;                     /* = (71/162)×130，头部层原始 88×71 */
+  -webkit-user-drag: none;
+  user-select: none;
+  pointer-events: none;             /* 头部不拦截拖动 */
+  transform-origin: 50% 100%;       /* 以颈为轴：头部更灵活 */
+  transition: transform 0.18s ease-out;
+  will-change: transform;
+}
+
+/* 辉光层：说话时径向脉动 */
+#halo {
+  position: absolute;
+  inset: -11px -8px;
+  background: radial-gradient(
+    ellipse at 50% 58%,
+    rgba(64, 196, 255, 0.55),
+    rgba(64, 196, 255, 0) 68%
+  );
+  border-radius: 50%;
+  opacity: 0;
+  z-index: 0;
+  pointer-events: none;
+  filter: blur(3px);
+}
+
+#glow.speaking #halo {
+  animation: haloPulse 0.6s ease-in-out infinite alternate;
+}
+
+@keyframes haloPulse {
+  from {
+    opacity: 0.22;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 0.85;
+    transform: scale(1.07);
+  }
+}
+
+/* ---------- 说话气泡 ---------- */
+
+#bubble {
+  position: absolute;
+  left: 50%;
+  bottom: 142px;
+  transform: translateX(-50%);
+  max-width: 186px;
+  min-width: 48px;
+  background: rgba(10, 18, 32, 0.93);
+  border: 1px solid rgba(90, 170, 255, 0.45);
+  border-radius: 11px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #eaf3ff;
+  white-space: pre-line;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+  z-index: 20;
+  pointer-events: none;
+  animation: bubbleIn 0.22s ease-out;
+}
+
+/* 气泡尾巴 */
+#bubble::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -6px;
+  transform: translateX(-50%) rotate(45deg);
+  width: 10px;
+  height: 10px;
+  background: rgba(10, 18, 32, 0.93);
+  border-right: 1px solid rgba(90, 170, 255, 0.45);
+  border-bottom: 1px solid rgba(90, 170, 255, 0.45);
+  border-bottom-right-radius: 3px;
+}
+
+@keyframes bubbleIn {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+#bubble.hidden {
+  display: none;
+}
+
+/* ---------- 右键菜单 ---------- */
+
+#ctx {
+  position: absolute;
+  z-index: 30;
+  min-width: 118px;
+  background: rgba(14, 22, 38, 0.96);
+  border: 1px solid rgba(120, 165, 225, 0.4);
+  border-radius: 10px;
+  padding: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.55);
+  animation: bubbleIn 0.14s ease-out;
+}
+
+#ctx.hidden {
+  display: none;
+}
+
+#ctx button {
+  background: transparent;
+  border: none;
+  color: #dce7ff;
+  font: 13px/1.4 "Microsoft YaHei", "PingFang SC", sans-serif;
+  padding: 8px 13px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+
+#ctx button:hover {
+  background: rgba(80, 160, 255, 0.28);
+}
+
+#ctx button.quit {
+  color: #ff9d9d;
+}
+
+#ctx button.quit:hover {
+  background: rgba(255, 90, 90, 0.22);
+}

@@ -1,0 +1,14 @@
+{
+  "name": "jarvis2-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "JARVIS2 桌面应用 + 透明桌宠（Tauri 2 + Python sidecar）",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
