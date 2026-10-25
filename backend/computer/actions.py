@@ -28,6 +28,7 @@ from . import windows
 from .trace import (
     ExecutionTrace,
     active_execution_trace,
+    current_execution_trace_context,
     execution_trace_context,
     new_execution_trace,
     window_metadata,
@@ -70,10 +71,31 @@ _CONFIRMATION_LABELS = {
     "click_control": "确认点击",
     "set_text": "确认输入",
 }
+_CONFIRMATION_COMMANDS = frozenset({"确认", "确认执行", "是", "yes", "继续"})
+_REJECTION_COMMANDS = frozenset({"取消", "不执行", "拒绝", "no"})
+CONFIRMATION_CONFIRM = "CONFIRM"
+CONFIRMATION_REJECT = "REJECT"
+CONFIRMATION_NONE = "NONE"
 
 _LOCK = threading.RLock()
 _EXECUTION_LOCK = threading.Lock()
 _PENDING: dict[str, dict] = {}
+
+
+def parse_confirmation(text: object) -> str:
+    """解析精确的确认/拒绝短语，不调用语义模型或模糊匹配。"""
+    if not isinstance(text, str):
+        return CONFIRMATION_NONE
+    normalized = " ".join(text.strip().split()).casefold()
+    if normalized in _CONFIRMATION_COMMANDS:
+        return CONFIRMATION_CONFIRM
+    if normalized in _REJECTION_COMMANDS:
+        return CONFIRMATION_REJECT
+    return CONFIRMATION_NONE
+
+
+def _session_id(value: object) -> str:
+    return str(value).strip() if value is not None and str(value).strip() else "session:default"
 
 
 def _action_error(result: dict | None, fallback_code: str, fallback_message: str) -> dict:
@@ -360,6 +382,9 @@ def _create_pending(action: str, payload: dict, *, target: str,
     now_wall = time.time()
     now_mono = time.monotonic()
     action_id = f"computer-action-{uuid.uuid4().hex[:16]}"
+    context = current_execution_trace_context()
+    source = str(context.get("source") or "standalone_action")
+    owner = "desktop_task" if source == "desktop_task_step" else "standalone_action"
     item = {
         "action_id": action_id,
         "action": action,
@@ -370,6 +395,9 @@ def _create_pending(action: str, payload: dict, *, target: str,
         "expires_at": now_wall + ACTION_TTL_SECONDS,
         "expires_mono": now_mono + ACTION_TTL_SECONDS,
         "status": "pending",
+        "session_id": _session_id(context.get("session_id")),
+        "source": source,
+        "owner": owner,
         "debug": dict(debug or {}),
         "trace": trace,
     }
@@ -380,6 +408,29 @@ def _create_pending(action: str, payload: dict, *, target: str,
         trace.bind(action_id=action_id, action_type=action)
         trace.emit("CONFIRMATION_CREATED")
     return _public_pending(item)
+
+
+def get_pending_action_for_session(session_id: object) -> dict | None:
+    """返回当前 session 唯一的 standalone active action，异常时 fail closed。"""
+    session = _session_id(session_id)
+    with _LOCK:
+        _purge_expired()
+        matches = [
+            item for item in _PENDING.values()
+            if item.get("session_id") == session
+            and item.get("owner") == "standalone_action"
+            and item.get("status") == "pending"
+        ]
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "status": "ambiguous",
+                "error_code": "AMBIGUOUS_PENDING_ACTION",
+                "error": "当前 session 存在多个待确认本机动作，已拒绝自动选择。",
+            }
+        if not matches:
+            return None
+        return _public_pending(matches[0])
 
 
 def create_open_url_plan(url: str, requested_plan_id: str | None = None, *,
@@ -446,7 +497,7 @@ def create_pending_action(plan: dict, text: str) -> dict:
     requested_plan_id = plan.get("plan_id")
     trace = new_execution_trace({"action_type": action})
     trace.emit(
-        "PREPARE_START",
+        "ACTIVATE_PREPARE_START" if action == "activate_window" else "PREPARE_START",
         action_type=action,
         window_target=request.get("window_query") or "",
         control_target=request.get("control_name") or "",
@@ -458,12 +509,15 @@ def create_pending_action(plan: dict, text: str) -> dict:
         )
     if action == "activate_window":
         resolved = windows.resolve_window(request.get("window_query"))
+        trace.bind_target_window(resolved.get("window"))
         trace.emit("WINDOW_RESOLVED", window=window_metadata(resolved.get("window")))
         debug = _debug_meta(resolved, raw_target=request.get("window_query", ""))
         _log_action_phase({"action": action, "debug": debug}, "prepare", resolved)
         if not resolved.get("ok"):
             trace.emit("RESULT", status="failed", ok=False,
-                       error_code=resolved.get("error_code") or "WINDOW_NOT_FOUND")
+                       verified=False,
+                       error_code=resolved.get("error_code") or "WINDOW_NOT_FOUND",
+                       runtime_state="")
             return _action_error(resolved, "WINDOW_NOT_FOUND", "无法定位目标窗口")
         window = resolved.get("window") or {}
         pending = _create_pending(
@@ -560,15 +614,22 @@ def _execute_pending(item: dict) -> dict:
     window_query = payload.get("window_query") or None
     resolved = windows.resolve_window(window_query)
     if trace is not None:
+        trace.bind_target_window(resolved.get("window"))
         trace.emit("WINDOW_RELOCATED", window=window_metadata(resolved.get("window")))
     _log_action_phase(item, "re-locate", resolved)
     if not resolved.get("ok"):
         return _action_error(resolved, "WINDOW_NOT_FOUND", "无法重新定位目标窗口")
     window = resolved.get("window") or {}
     if action == "activate_window":
-        outcome = windows.activate_window(
-            window.get("hwnd"), expected_process_id=int(window.get("process_id") or 0),
-        )
+        if trace is not None:
+            with active_execution_trace(trace):
+                outcome = windows.activate_window(
+                    window.get("hwnd"), expected_process_id=int(window.get("process_id") or 0),
+                )
+        else:
+            outcome = windows.activate_window(
+                window.get("hwnd"), expected_process_id=int(window.get("process_id") or 0),
+            )
         _log_action_phase(item, "execute", outcome)
         return outcome
     if action == "click_control":
@@ -705,7 +766,9 @@ def confirm_action(action_id: str) -> dict:
     if trace is not None:
         trace.emit(
             "RESULT", action_id=key, status=result.get("status"), ok=ok,
-            verified=verified, error_code=final_code or None,
+            verified=verified, error_code=final_code or "",
+            runtime_state=outcome.get("execution_state") or "",
+            **trace.result_fields(),
         )
     if snapshot.get("action") == "open_url":
         result["url"] = (snapshot.get("payload") or {}).get("url", "")

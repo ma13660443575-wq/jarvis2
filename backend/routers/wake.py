@@ -107,10 +107,9 @@ def wake_command(body: WakeCmdIn):
     action_plan: dict | None = None
     action_result: dict | None = None
     task_result: dict | None = None
-    planned_plan = broker.plan_command(text)
     _t0 = time.time()
     try:
-        for evt in answer.chat_stream(text, None, planned_plan=planned_plan):
+        for evt in answer.chat_stream(text, None):
             et = evt.get("type")
             if et == "delta":
                 reply_parts.append(str(evt.get("text", "")))

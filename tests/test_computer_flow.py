@@ -7,6 +7,7 @@ import json
 import pytest
 
 from backend.brain import answer
+from backend.computer import actions
 from backend.routers import command as command_router
 from backend.routers import computer as computer_router
 from backend.routers import wake as wake_router
@@ -271,3 +272,136 @@ def test_regular_question_still_enters_conversation_rag_and_llm(monkeypatch):
     assert "llm" in calls
     assert any(evt.get("type") == "sources" for evt in events)
     assert any(evt.get("type") == "delta" and evt.get("text") == "普通回答" for evt in events)
+
+
+def _prepare_open_url_for_session(session_id: str):
+    actions._reset_for_tests()
+    return_context = actions.execution_trace_context({"session_id": session_id})
+    with return_context:
+        return actions.create_open_url_plan("https://example.com")
+
+
+def _stub_conversation_path(monkeypatch, calls):
+    monkeypatch.setattr(answer, "register_hands", lambda: calls.append("register"))
+    monkeypatch.setattr(
+        answer.broker, "plan_command",
+        lambda _text: calls.append("plan") or {
+            "mode": "conversation", "capability_id": "chat.answer",
+        },
+    )
+    monkeypatch.setattr(
+        answer.db.ops, "get_or_create_conversation",
+        lambda *_args, **_kwargs: calls.append("conversation") or 1,
+    )
+    monkeypatch.setattr(answer.db.ops, "add_message", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(answer.registry, "parse_command", lambda _text: {"type": "unknown"})
+    monkeypatch.setattr(answer.classify, "classify_question", lambda _text: "direct")
+    monkeypatch.setattr(answer.persona, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(answer.db.ops, "history_messages", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        answer.llm, "chat_stream_iter",
+        lambda *_args, **_kwargs: calls.append("llm") or iter(["普通回答"]),
+    )
+    monkeypatch.setattr(
+        answer.llm, "extract_memory_candidates",
+        lambda *_args, **_kwargs: calls.append("memory") or [],
+    )
+    monkeypatch.setattr(answer.db.ops, "add_memory_candidates", lambda *_args: [])
+
+
+def test_chat_confirmation_continuation_confirms_same_session_without_llm(monkeypatch):
+    pending = _prepare_open_url_for_session("session:7")
+    calls: list[str] = []
+    monkeypatch.setattr(answer.broker, "plan_command", lambda *_args: calls.append("plan"))
+    monkeypatch.setattr(answer.db.ops, "get_or_create_conversation", lambda *_args, **_kwargs: calls.append("conversation"))
+    monkeypatch.setattr(answer.llm, "chat_stream_iter", lambda *_args, **_kwargs: calls.append("llm"))
+    monkeypatch.setattr(answer.llm, "extract_memory_candidates", lambda *_args, **_kwargs: calls.append("memory"))
+    monkeypatch.setattr(actions, "_execute_pending", lambda _item: {"ok": True, "verified": True})
+    monkeypatch.setattr(actions, "_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(actions.notify, "publish", lambda *args, **kwargs: None)
+
+    events = list(answer.chat_stream("确认", conversation_id=7))
+
+    result = next(evt for evt in events if evt.get("type") == "computer_action_result")
+    assert result["status"] == "success"
+    assert result["action_id"] == pending["action_id"]
+    assert "conversation" not in calls
+    assert "llm" not in calls
+    assert "memory" not in calls
+    assert "plan" not in calls
+    assert next(evt for evt in events if evt.get("type") == "done")["terminal"] is True
+
+
+def test_chat_confirmation_cannot_cross_session(monkeypatch):
+    pending = _prepare_open_url_for_session("session:8")
+    calls: list[str] = []
+    _stub_conversation_path(monkeypatch, calls)
+    events = list(answer.chat_stream("确认", conversation_id=9))
+
+    assert any(evt.get("type") == "delta" and evt.get("text") == "收到。" for evt in events)
+    assert actions.get_pending_action_for_session("session:8")["action_id"] == pending["action_id"]
+    assert "conversation" not in calls
+    assert "llm" not in calls
+
+
+def test_chat_rejection_continuation_cancels_same_session_without_llm(monkeypatch):
+    pending = _prepare_open_url_for_session("session:11")
+    calls: list[str] = []
+    monkeypatch.setattr(answer.broker, "plan_command", lambda *_args: calls.append("plan"))
+    monkeypatch.setattr(answer.db.ops, "get_or_create_conversation", lambda *_args, **_kwargs: calls.append("conversation"))
+    monkeypatch.setattr(answer.llm, "chat_stream_iter", lambda *_args, **_kwargs: calls.append("llm"))
+    monkeypatch.setattr(answer.llm, "extract_memory_candidates", lambda *_args, **_kwargs: calls.append("memory"))
+    monkeypatch.setattr(actions, "_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(actions.notify, "publish", lambda *args, **kwargs: None)
+
+    events = list(answer.chat_stream("取消", conversation_id=11))
+
+    result = next(evt for evt in events if evt.get("type") == "computer_action_result")
+    assert result["status"] == "cancelled"
+    assert result["action_id"] == pending["action_id"]
+    assert "conversation" not in calls
+    assert "llm" not in calls
+    assert "memory" not in calls
+    assert "plan" not in calls
+
+
+def test_confirmation_without_pending_action_uses_lightweight_gate(monkeypatch):
+    calls: list[str] = []
+    _stub_conversation_path(monkeypatch, calls)
+
+    events = list(answer.chat_stream("确认"))
+
+    assert any(evt.get("type") == "delta" and evt.get("text") == "收到。" for evt in events)
+    assert "conversation" not in calls
+    assert "llm" not in calls
+
+
+def test_pending_action_and_natural_language_confirmation_do_not_execute(monkeypatch):
+    pending = _prepare_open_url_for_session("session:10")
+    calls: list[str] = []
+    _stub_conversation_path(monkeypatch, calls)
+    monkeypatch.setattr(
+        actions, "confirm_action",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not confirm")),
+    )
+
+    events = list(answer.chat_stream("我想确认一下这个设计", conversation_id=10))
+
+    assert any(evt.get("type") == "delta" and evt.get("text") == "普通回答" for evt in events)
+    assert actions.get_pending_action_for_session("session:10")["action_id"] == pending["action_id"]
+
+
+def test_wake_confirmation_uses_the_same_continuation_dispatch(monkeypatch):
+    pending = _prepare_open_url_for_session("session:default")
+    monkeypatch.setattr(actions, "_execute_pending", lambda _item: {"ok": True, "verified": True})
+    monkeypatch.setattr(actions, "_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(actions.notify, "publish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wake_router.notify, "publish", lambda *args, **kwargs: None)
+    from backend.db import evals as evals_db
+    monkeypatch.setattr(evals_db, "record_eval", lambda *args, **kwargs: None)
+
+    response = wake_router.wake_command(wake_router.WakeCmdIn(text="确认"))
+
+    assert response["ok"] is True
+    assert response["data"]["action_result"]["status"] == "success"
+    assert response["data"]["action_result"]["action_id"] == pending["action_id"]

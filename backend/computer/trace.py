@@ -7,8 +7,10 @@ source/task/step 归属，因此不改变动作 API 和执行顺序。
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -22,12 +24,20 @@ LOGGER = logging.getLogger("jarvis2.desktop_execution_trace")
 
 TRACE_STAGES = frozenset({
     "PREPARE_START",
+    "ACTIVATE_PREPARE_START",
     "WINDOW_RESOLVED",
     "CONTROL_PATH_SELECTED",
     "CONFIRMATION_CREATED",
     "CONFIRM_RECEIVED",
     "EXECUTE_START",
     "WINDOW_RELOCATED",
+    "FOREGROUND_BEFORE",
+    "ACTIVATE_METHOD_START",
+    "ACTIVATE_CALLED",
+    "ACTIVATE_RETURNED",
+    "ACTIVATE_METHOD_RESULT",
+    "FOREGROUND_IMMEDIATE",
+    "FOREGROUND_VERIFY",
     "FILE_CONTROL_RESOLVED",
     "BEFORE_EXPAND",
     "EXPAND_RETURNED",
@@ -54,6 +64,12 @@ _ALLOWED_FIELDS = frozenset({
     "popup_candidate_count", "selected_popup", "save_item_found",
     "timeout_ms", "error_code", "status", "verified", "ok", "changed",
     "invoke_method", "selected_control", "popup_identity",
+    "target_title", "target_class", "target_process_id", "target_hwnd",
+    "foreground_hwnd", "foreground_title", "foreground_class",
+    "foreground_process_id", "method_name", "return_value",
+    "activate_return_value", "last_error", "expected_hwnd",
+    "actual_foreground_hwnd", "expected_process_id",
+    "actual_foreground_process_id", "runtime_state",
 })
 
 
@@ -140,50 +156,93 @@ class ExecutionTrace:
         )
         self._metadata = {
             "source": str(context.get("source") or "standalone_action"),
+            "process_id": os.getpid(),
             "task_id": context.get("task_id"),
             "step_id": context.get("step_id"),
             "action_id": context.get("action_id"),
             "action_type": context.get("action_type"),
+            "target_title": context.get("target_title"),
+            "target_class": context.get("target_class"),
+            "target_process_id": context.get("target_process_id"),
+            "target_hwnd": context.get("target_hwnd"),
         }
         self._started = time.monotonic()
+        self._result_fields: dict[str, object] = {}
 
     @property
     def trace_id(self) -> str:
         return self.execution_trace_id
 
     def bind(self, **fields: object) -> None:
-        for key in ("source", "task_id", "step_id", "action_id", "action_type"):
+        for key in (
+            "source", "task_id", "step_id", "action_id", "action_type",
+            "target_title", "target_class", "target_process_id", "target_hwnd",
+        ):
             value = fields.get(key)
             if value is not None and value != "":
-                self._metadata[key] = str(value)[:240]
+                self._metadata[key] = _safe_scalar(value)
+
+    def bind_target_window(self, window: object) -> None:
+        if not isinstance(window, dict):
+            return
+        self.bind(
+            target_title=window.get("title"),
+            target_class=window.get("class_name"),
+            target_process_id=window.get("process_id"),
+            target_hwnd=window.get("hwnd") or window.get("native_window_handle"),
+        )
+
+    def set_result_fields(self, **fields: object) -> None:
+        for key, value in fields.items():
+            if key in {
+                "expected_hwnd", "actual_foreground_hwnd", "expected_process_id",
+                "actual_foreground_process_id",
+            } and value is not None:
+                self._result_fields[key] = _safe_scalar(value)
+
+    def result_fields(self) -> dict[str, object]:
+        return dict(self._result_fields)
 
     def emit(self, stage: str, **fields: object) -> None:
         if stage not in TRACE_STAGES:
             return
-        payload = {
-            "execution_trace_id": self.execution_trace_id,
-            "stage": stage,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "monotonic_elapsed_ms": int((time.monotonic() - self._started) * 1000),
-            "thread_id": threading.get_ident(),
-            "thread_name": threading.current_thread().name,
-            "event_loop_context": "sync",
-        }
-        for key, value in self._metadata.items():
-            if value is not None and value != "":
-                payload[key] = _safe_scalar(value)
-        for key, value in fields.items():
-            if key not in _ALLOWED_FIELDS or value is None:
-                continue
-            if key in {"window", "control", "candidate", "selected_control"}:
-                payload[key] = _safe_record(value)
-            elif key == "selected_popup":
-                payload[key] = bool(value)
-            else:
-                payload[key] = _safe_scalar(value)
-        LOGGER.info("desktop_execution_trace %s", json.dumps(
-            payload, ensure_ascii=False, sort_keys=True,
-        ))
+        try:
+            payload = {
+                "execution_trace_id": self.execution_trace_id,
+                "stage": stage,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "monotonic_elapsed_ms": int((time.monotonic() - self._started) * 1000),
+                "thread_id": threading.get_ident(),
+                "thread_name": threading.current_thread().name,
+                "event_loop_context": "sync",
+            }
+            for key, value in self._metadata.items():
+                if value is not None and value != "":
+                    payload[key] = _safe_scalar(value)
+            try:
+                loop = asyncio.get_running_loop()
+                payload["event_loop_context"] = "running"
+                payload["loop_id"] = id(loop)
+                current_task = asyncio.current_task(loop=loop)
+                if current_task is not None:
+                    payload["current_task_id"] = id(current_task)
+            except RuntimeError:
+                pass
+            for key, value in fields.items():
+                if key not in _ALLOWED_FIELDS or value is None:
+                    continue
+                if key in {"window", "control", "candidate", "selected_control"}:
+                    payload[key] = _safe_record(value)
+                elif key == "selected_popup":
+                    payload[key] = bool(value)
+                else:
+                    payload[key] = _safe_scalar(value)
+            LOGGER.info("desktop_execution_trace %s", json.dumps(
+                payload, ensure_ascii=False, sort_keys=True,
+            ))
+        except Exception:  # noqa: BLE001
+            # 诊断旁路不得改变动作执行的异常或返回语义。
+            pass
 
 
 def new_execution_trace(context: dict | None = None) -> ExecutionTrace:

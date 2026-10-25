@@ -32,6 +32,295 @@ def _looks_like_chat(question: str) -> bool:
     return any(w in q for w in _ASK_WORDS)
 
 
+def _session_id(conversation_id: int | None) -> str:
+    return f"session:{conversation_id}" if conversation_id is not None else "session:default"
+
+
+def _continuation_dispatch(question: str, session_id: str) -> dict | None:
+    """Resolve existing execution ownership before semantic planning."""
+    from ..agent import task_engine
+
+    task_pending = task_engine.pending_confirmation_for_session(session_id)
+    decision = computer_actions.parse_confirmation(question)
+    if task_pending is not None and decision != computer_actions.CONFIRMATION_NONE:
+        return {
+            "decision": decision,
+            "owner": "desktop_task",
+            "pending": task_pending,
+        }
+
+    waiting_user = task_engine.waiting_user_for_session(session_id)
+    if waiting_user is not None:
+        return {
+            "owner": "desktop_task_waiting_user",
+            "pending": waiting_user,
+        }
+
+    standalone_pending = computer_actions.get_pending_action_for_session(session_id)
+    if decision == computer_actions.CONFIRMATION_NONE:
+        return None
+    if standalone_pending is not None:
+        return {
+            "decision": decision,
+            "owner": "computer_action",
+            "pending": standalone_pending,
+        }
+    return None
+
+
+def _standalone_pending_plan(pending: dict) -> dict:
+    action = str(pending.get("action") or "")
+    return {
+        "mode": "command",
+        "capability_id": computer_actions.action_capability_id(action),
+        "action": action,
+        "action_id": pending.get("action_id"),
+        "target": pending.get("target", ""),
+        "status": "waiting_confirmation",
+        "requires_confirmation": True,
+        "confirmation_label": computer_actions.confirmation_label(action),
+        "computer_action_owned": True,
+    }
+
+
+def _waiting_user_stream(question: str, session_id: str, pending: dict) -> Iterator[dict]:
+    """Consume a Task WAITING_USER continuation without semantic planning."""
+    from ..agent import task_engine
+
+    task_plan = pending.get("task_plan") or {
+        "mode": "task",
+        "task_state": "WAITING_USER",
+        "status": "waiting_user",
+        "desktop_task_owned": True,
+    }
+    task_id = pending.get("task_id")
+    yield {
+        "type": "start",
+        "question": question,
+        "mode": "task",
+        "desktop_task_owned": True,
+        "task_id": task_id,
+    }
+    yield {"type": "plan", "plan": task_plan}
+
+    if not pending.get("ok"):
+        task_result = {
+            "task_id": task_id or "",
+            "status": "WAITING_USER",
+            "business_goal_completed": False,
+            "reason": pending.get("error", "当前 Task continuation 绑定无效"),
+            "error_code": pending.get("error_code", "TASK_WAITING_USER_INVALID"),
+            "current_step_id": pending.get("step_id"),
+            "step_results": [],
+            "action_result": None,
+            "idempotent": False,
+        }
+        text = task_result["reason"]
+        yield _step("input", text)
+        yield {"type": "delta", "text": text}
+        yield {
+            "type": "done",
+            "action_plan": task_plan,
+            "task_result": task_result,
+            "terminal": True,
+            "desktop_task_owned": True,
+            "sources": [],
+            "candidates": [],
+            "candidate_ids": [],
+            "token_usage": None,
+        }
+        return
+
+    try:
+        continued = task_engine.handle_waiting_user_input(task_id, session_id, question)
+        task_plan = continued["task_plan"]
+        task_result = continued["task_result"]
+        text = continued["message"]
+        step_kind = "cancel" if continued.get("status") == "cancelled" else "input"
+    except task_engine.TaskRuntimeError as exc:
+        task_result = {
+            "task_id": task_id or "",
+            "status": "FAILED",
+            "business_goal_completed": False,
+            "reason": exc.message,
+            "error_code": exc.code,
+            "current_step_id": pending.get("step_id"),
+            "step_results": [],
+            "action_result": None,
+            "idempotent": False,
+        }
+        text = f"任务无法继续：{exc.message}"
+        step_kind = "exec"
+
+    yield _step(step_kind, text)
+    yield {"type": "delta", "text": text}
+    yield {
+        "type": "done",
+        "action_plan": task_plan,
+        "task_result": task_result,
+        "terminal": True,
+        "desktop_task_owned": True,
+        "sources": [],
+        "candidates": [],
+        "candidate_ids": [],
+        "token_usage": None,
+    }
+
+
+def _continuation_stream(question: str, session_id: str, dispatch: dict) -> Iterator[dict]:
+    """Consume exactly one existing execution owner and finish this request."""
+    if dispatch["owner"] == "desktop_task_waiting_user":
+        yield from _waiting_user_stream(question, session_id, dispatch["pending"])
+        return
+
+    decision = dispatch["decision"]
+    pending = dispatch["pending"]
+    if dispatch["owner"] == "desktop_task":
+        from ..agent import task_engine
+
+        task_plan = pending.get("task_plan") or {}
+        yield {
+            "type": "start", "question": question, "mode": "task",
+            "desktop_task_owned": True, "task_id": pending.get("task_id"),
+        }
+        yield {"type": "plan", "plan": task_plan}
+        if not pending.get("ok"):
+            task_result = {
+                "task_id": pending.get("task_id", ""),
+                "status": "FAILED",
+                "business_goal_completed": False,
+                "reason": pending.get("error", "Task confirmation 绑定无效"),
+                "error_code": pending.get("error_code", "TASK_CONFIRMATION_INVALID"),
+                "current_step_id": pending.get("step_id"),
+                "step_results": [],
+                "action_result": None,
+                "idempotent": False,
+            }
+            yield _step("exec", "任务确认绑定无效")
+            yield {"type": "delta", "text": f"任务无法继续：{task_result['reason']}"}
+            yield {
+                "type": "done", "action_plan": task_plan, "task_result": task_result,
+                "terminal": True, "desktop_task_owned": True,
+                "sources": [], "candidates": [], "candidate_ids": [],
+                "token_usage": None,
+            }
+            return
+
+        try:
+            if decision == computer_actions.CONFIRMATION_CONFIRM:
+                continued = task_engine.confirm_step(
+                    pending["task_id"], pending["step_id"], pending["action_id"],
+                )
+                text = "已确认当前任务步骤。"
+                step_kind = "confirm"
+            else:
+                continued = task_engine.reject_step(
+                    pending["task_id"], pending["step_id"], pending["action_id"],
+                )
+                text = "已取消当前任务步骤。"
+                step_kind = "cancel"
+            task_plan = continued["task_plan"]
+            task_result = continued["task_result"]
+            if task_result.get("status") == "FAILED":
+                text = f"任务步骤执行失败：{task_result.get('reason') or '未知错误'}"
+            elif task_result.get("status") == "CANCELLED":
+                text = "已取消当前任务。"
+        except task_engine.TaskRuntimeError as exc:
+            task_result = {
+                "task_id": pending.get("task_id", ""),
+                "status": "FAILED",
+                "business_goal_completed": False,
+                "reason": exc.message,
+                "error_code": exc.code,
+                "current_step_id": pending.get("step_id"),
+                "step_results": [],
+                "action_result": None,
+                "idempotent": False,
+            }
+            text = f"任务无法继续：{exc.message}"
+            step_kind = "exec"
+        yield _step(step_kind, text)
+        yield {"type": "delta", "text": text}
+        yield {
+            "type": "done", "action_plan": task_plan, "task_result": task_result,
+            "terminal": True, "desktop_task_owned": True,
+            "sources": [], "candidates": [], "candidate_ids": [],
+            "token_usage": None,
+        }
+        return
+
+    action_plan = _standalone_pending_plan(pending)
+    yield {
+        "type": "start", "question": question, "mode": "command",
+        "computer_action_owned": True,
+    }
+    yield {"type": "plan", "plan": action_plan}
+    yield _step(
+        "confirm" if decision == computer_actions.CONFIRMATION_CONFIRM else "cancel",
+        "正在处理本机动作确认" if decision == computer_actions.CONFIRMATION_CONFIRM
+        else "正在取消本机动作",
+    )
+    if not pending.get("ok"):
+        result = computer_actions.build_terminal_failure_result(action_plan, pending)
+        text = f"本机动作无法继续：{result.get('error') or '待确认状态无效'}"
+    elif decision == computer_actions.CONFIRMATION_CONFIRM:
+        result = computer_actions.confirm_action(pending["action_id"])
+        text = "本机动作已完成。" if result.get("status") == "success" else (
+            f"本机动作执行失败：{result.get('error') or '未知错误'}"
+        )
+    else:
+        result = computer_actions.reject_action(pending["action_id"])
+        text = "已取消本机动作。" if result.get("status") == "cancelled" else (
+            f"本机动作无法取消：{result.get('error') or '未知错误'}"
+        )
+    yield result
+    yield {"type": "delta", "text": text}
+    final_plan = {
+        **action_plan,
+        "status": "completed" if result.get("status") == "success"
+        else "cancelled" if result.get("status") == "cancelled" else "failed",
+        "verified": result.get("verified", False),
+        **({"error_code": result["error_code"]} if result.get("error_code") else {}),
+    }
+    yield {
+        "type": "done", "action_plan": final_plan, "action_result": result,
+        "terminal": True, "computer_action_owned": True,
+        "sources": [], "candidates": [], "candidate_ids": [],
+        "token_usage": None,
+    }
+
+
+def _lightweight_reply(question: str, interaction: classify.LightweightInteraction) -> str:
+    normalized = " ".join(question.strip().split()).casefold()
+    if normalized == "确认":
+        return "收到。"
+    if interaction == classify.LightweightInteraction.THANKS:
+        return "不客气。"
+    return "好的。"
+
+
+def _lightweight_stream(question: str,
+                        interaction: classify.LightweightInteraction) -> Iterator[dict]:
+    """Return a deterministic terminal reply without entering conversation cognition."""
+    yield {
+        "type": "start",
+        "mode": "lightweight",
+        "lightweight": True,
+        "interaction": interaction.value,
+        "question": question,
+    }
+    yield {"type": "delta", "text": _lightweight_reply(question, interaction)}
+    yield {
+        "type": "done",
+        "terminal": True,
+        "lightweight": True,
+        "sources": [],
+        "candidates": [],
+        "candidate_ids": [],
+        "token_usage": None,
+    }
+
+
 def _step(kind: str, text: str) -> dict:
     """Agent 思考流事件（供前端终端命令行打字机展示）。"""
     return {"type": "step", "kind": kind, "text": text, "t": time.time()}
@@ -44,7 +333,10 @@ def _computer_action_stream(question: str, plan: dict,
 
     try:
         task_engine.ensure_desktop_execution_available(session_id)
-        pending = computer_actions.create_pending_action(plan, question)
+        with computer_actions.execution_trace_context({
+            "source": "standalone_action", "session_id": str(session_id),
+        }):
+            pending = computer_actions.create_pending_action(plan, question)
     except task_engine.TaskRuntimeError as exc:
         pending = {
             "ok": False,
@@ -164,6 +456,17 @@ def _desktop_task_stream(question: str, plan: dict,
 def chat_stream(question: str, conversation_id: int | None = None,
                 max_history_turns: int = 10,
                 planned_plan: dict | None = None) -> Iterator[dict]:
+    session_id = _session_id(conversation_id)
+    continuation = _continuation_dispatch(question, session_id)
+    if continuation is not None:
+        yield from _continuation_stream(question, session_id, continuation)
+        return
+
+    lightweight = classify.classify_lightweight_interaction(question)
+    if lightweight != classify.LightweightInteraction.NONE:
+        yield from _lightweight_stream(question, lightweight)
+        return
+
     # ===== 意图路由层：功能隐藏到 Agent 层 =====
     # 先完成能力注册与 Broker 归属判断；Computer Action 在此之前不得创建
     # Conversation、写入消息或进入后续 Memory/RAG/LLM 编排。
@@ -174,7 +477,6 @@ def chat_stream(question: str, conversation_id: int | None = None,
         yield from _desktop_task_stream(question, plan, conversation_id)
         return
     if owner == "computer_action":
-        session_id = f"session:{conversation_id}" if conversation_id is not None else "session:default"
         yield from _computer_action_stream(question, plan, session_id)
         return
 

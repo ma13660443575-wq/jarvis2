@@ -10,7 +10,7 @@ import threading
 import time
 from contextlib import contextmanager
 
-from .task_models import TaskRecord
+from .task_models import TaskRecord, TaskState
 from .task_state import is_active_task_state
 
 
@@ -44,6 +44,21 @@ class TaskStore:
                         and is_active_task_state(record.state.status)):
                     return record
         return None
+
+    def waiting_user_tasks_for_session(self, session_id: str) -> list[TaskRecord]:
+        """Return every exact-session WAITING_USER record.
+
+        This intentionally returns all matches instead of selecting the newest
+        record.  The Task Engine can therefore fail closed if an invariant is
+        ever violated and multiple waiting tasks exist for one session.
+        """
+        with self._lock:
+            return [
+                record
+                for record in self._tasks.values()
+                if record.context.session_id == session_id
+                and record.state.status == TaskState.WAITING_USER
+            ]
 
     def bind_action(self, action_id: str, task_id: str, step_id: str) -> None:
         with self._lock:

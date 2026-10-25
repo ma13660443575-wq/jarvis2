@@ -705,6 +705,50 @@ def resolve_window(query: str | None = None) -> dict:
     }
 
 
+def _safe_foreground_record(user32, kernel32, hwnd: int) -> dict:
+    """为 trace 读取前台窗口元数据；诊断读取失败不能影响动作结果。"""
+    if not hwnd:
+        return {}
+    try:
+        return _window_record(user32, kernel32, hwnd, active=True)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _trace_foreground(trace, stage: str, hwnd: int, record: dict) -> None:
+    try:
+        _trace_emit(
+            trace,
+            stage,
+            foreground_hwnd=hwnd,
+            foreground_title=record.get("title"),
+            foreground_class=record.get("class_name"),
+            foreground_process_id=record.get("process_id"),
+        )
+    except Exception:  # noqa: BLE001
+        # Trace 是诊断旁路，不能改变 Windows 动作的原有异常/返回语义。
+        pass
+
+
+def _trace_emit(trace, stage: str, **fields) -> None:
+    """尽力写入诊断事件；任何诊断异常都不能影响原动作。"""
+    if trace is None:
+        return
+    try:
+        trace.emit(stage, **fields)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _safe_foreground_hwnd(user32) -> int:
+    """读取埋点用前台句柄；失败时返回空值并继续原有动作。"""
+    try:
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        return _hwnd_value(user32.GetForegroundWindow())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def activate_window(hwnd: int, *, expected_process_id: int = 0) -> dict:
     """将一个已验证的可见窗口置前；不启动程序、不模拟快捷键。"""
     user32, kernel32 = _api()
@@ -730,15 +774,62 @@ def activate_window(hwnd: int, *, expected_process_id: int = 0) -> dict:
 
         user32.IsIconic.argtypes = [ctypes.c_void_p]
         user32.IsIconic.restype = wintypes.BOOL
+        trace = current_execution_trace()
         if user32.IsIconic(handle):
             user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
             user32.ShowWindow.restype = wintypes.BOOL
-            user32.ShowWindow(handle, 9)  # SW_RESTORE
+            if trace is not None:
+                _trace_emit(trace, "ACTIVATE_METHOD_START", method_name="ShowWindow")
+                show_return = user32.ShowWindow(handle, 9)  # SW_RESTORE
+                _trace_emit(
+                    trace,
+                    "ACTIVATE_METHOD_RESULT", method_name="ShowWindow",
+                    return_value=bool(show_return),
+                )
+            else:
+                user32.ShowWindow(handle, 9)  # SW_RESTORE
         user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
         user32.SetForegroundWindow.restype = wintypes.BOOL
+        if trace is not None:
+            before_foreground = _safe_foreground_hwnd(user32)
+            before_record = _safe_foreground_record(user32, kernel32, before_foreground)
+            _trace_foreground(trace, "FOREGROUND_BEFORE", before_foreground, before_record)
+            _trace_emit(trace, "ACTIVATE_METHOD_START", method_name="SetForegroundWindow")
+            _trace_emit(trace, "ACTIVATE_CALLED", method_name="SetForegroundWindow")
         focused = bool(user32.SetForegroundWindow(handle))
+        if trace is not None:
+            _trace_emit(
+                trace,
+                "ACTIVATE_RETURNED", method_name="SetForegroundWindow",
+                return_value=focused, activate_return_value=focused,
+            )
         user32.GetForegroundWindow.restype = ctypes.c_void_p
         now_foreground = _hwnd_value(user32.GetForegroundWindow())
+        if trace is not None:
+            foreground_record = _safe_foreground_record(user32, kernel32, now_foreground)
+            _trace_foreground(trace, "FOREGROUND_IMMEDIATE", now_foreground, foreground_record)
+            _trace_emit(
+                trace,
+                "ACTIVATE_METHOD_RESULT", method_name="SetForegroundWindow",
+                return_value=focused,
+            )
+        if trace is not None:
+            try:
+                trace.set_result_fields(
+                    expected_hwnd=hwnd,
+                    actual_foreground_hwnd=now_foreground,
+                    expected_process_id=expected_process_id,
+                    actual_foreground_process_id=foreground_record.get("process_id"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            _trace_emit(
+                trace, "VERIFY_START", expected_hwnd=hwnd,
+                actual_foreground_hwnd=now_foreground,
+                expected_process_id=expected_process_id,
+                actual_foreground_process_id=foreground_record.get("process_id"),
+            )
+            _trace_foreground(trace, "FOREGROUND_VERIFY", now_foreground, foreground_record)
         if not focused and now_foreground != hwnd:
             return _error(
                 "PERMISSION_DENIED",

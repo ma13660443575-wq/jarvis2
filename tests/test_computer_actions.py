@@ -4,9 +4,56 @@ from __future__ import annotations
 
 import logging
 import json
+from contextlib import nullcontext
+
+import pytest
 
 from backend.agent import broker
 from backend.computer import actions
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("确认", actions.CONFIRMATION_CONFIRM),
+    ("确认执行", actions.CONFIRMATION_CONFIRM),
+    ("是", actions.CONFIRMATION_CONFIRM),
+    ("YES", actions.CONFIRMATION_CONFIRM),
+    ("  继续  ", actions.CONFIRMATION_CONFIRM),
+    ("取消", actions.CONFIRMATION_REJECT),
+    ("不执行", actions.CONFIRMATION_REJECT),
+    ("拒绝", actions.CONFIRMATION_REJECT),
+    ("No", actions.CONFIRMATION_REJECT),
+    ("我想确认一下这个设计", actions.CONFIRMATION_NONE),
+    ("确认执行一下", actions.CONFIRMATION_NONE),
+    ("", actions.CONFIRMATION_NONE),
+])
+def test_confirmation_parser_is_exact_and_case_insensitive(text, expected):
+    assert actions.parse_confirmation(text) == expected
+
+
+def test_pending_action_ownership_is_session_scoped_and_fails_closed_on_ambiguity():
+    actions._reset_for_tests()
+    with actions.execution_trace_context({"session_id": "session:a"}):
+        first = actions.create_open_url_plan("https://example.com/one")
+    assert actions.get_pending_action_for_session("session:a")["action_id"] == first["action_id"]
+    assert actions.get_pending_action_for_session("session:b") is None
+
+    with actions.execution_trace_context({"session_id": "session:a"}):
+        second = actions.create_open_url_plan("https://example.com/two")
+    ambiguous = actions.get_pending_action_for_session("session:a")
+    assert ambiguous["status"] == "ambiguous"
+    assert ambiguous["error_code"] == "AMBIGUOUS_PENDING_ACTION"
+    assert second["action_id"] != first["action_id"]
+
+
+def test_pending_action_expiry_and_terminal_state_are_not_continuable():
+    actions._reset_for_tests()
+    planned = actions.create_open_url_plan("https://example.com")
+    actions._PENDING[planned["action_id"]]["expires_mono"] = 0
+    assert actions.get_pending_action_for_session("session:default") is None
+
+    planned = actions.create_open_url_plan("https://example.com")
+    actions.reject_action(planned["action_id"])
+    assert actions.get_pending_action_for_session("session:default") is None
 
 
 def test_only_http_url_can_be_planned():
@@ -215,6 +262,136 @@ def test_standalone_action_trace_is_structured_and_excludes_input_body(monkeypat
     assert '"stage": "CONFIRMATION_CREATED"' in joined
     assert '"stage": "RESULT"' in joined
     assert "输入正文" not in joined
+
+
+def test_activate_trace_schema_is_shared_and_result_is_unchanged(monkeypatch, caplog):
+    class FakeFunction:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    def run_action(context, *, move_foreground: bool):
+        actions._reset_for_tests()
+        foreground = {"hwnd": 100}
+        user32 = type("FakeUser32", (), {})()
+        user32.IsWindow = FakeFunction(lambda _handle: True)
+        user32.IsWindowVisible = FakeFunction(lambda _handle: True)
+        user32.IsIconic = FakeFunction(lambda _handle: False)
+        user32.GetForegroundWindow = FakeFunction(lambda: foreground["hwnd"])
+
+        def set_foreground(handle):
+            if move_foreground:
+                foreground["hwnd"] = int(getattr(handle, "value", handle) or 0)
+            return True
+
+        user32.SetForegroundWindow = FakeFunction(set_foreground)
+        monkeypatch.setattr(actions.windows, "_api", lambda: (user32, object()))
+        monkeypatch.setattr(actions.windows, "_window_pid", lambda _user32, _hwnd: {
+            100: 3, 101: 7, 202: 7,
+        }.get(_hwnd, 0))
+
+        def window_record(_user32, _kernel32, hwnd, *, active=False):
+            if hwnd == 100:
+                return {"hwnd": 100, "title": "Edge", "class_name": "Chrome_WidgetWin_1",
+                        "process_id": 3, "process_name": "msedge.exe", "active": active}
+            return {"hwnd": hwnd, "title": "记事本", "class_name": "Notepad",
+                    "process_id": 7, "process_name": "notepad.exe", "active": active}
+
+        monkeypatch.setattr(actions.windows, "_window_record", window_record)
+        first = {"hwnd": 101, "title": "无标题 - Notepad", "class_name": "Notepad",
+                 "process_id": 7, "process_name": "notepad.exe"}
+        second = {"hwnd": 202, "title": "Task Activate Trace - Notepad",
+                  "class_name": "Notepad", "process_id": 7, "process_name": "notepad.exe"}
+        resolved = []
+
+        def resolve(_query):
+            window = first if not resolved else second
+            resolved.append(window)
+            return {"ok": True, "available": True, "window": window}
+
+        monkeypatch.setattr(actions.windows, "resolve_window", resolve)
+        command = "激活「记事本」"
+        plan = broker.plan_command(command)
+        context_manager = actions.execution_trace_context(context) if context else nullcontext()
+        with caplog.at_level(logging.INFO, logger="jarvis2.desktop_execution_trace"):
+            with context_manager:
+                pending = actions.create_pending_action(plan, command)
+            result = actions.confirm_action(pending["action_id"])
+
+        payloads = [
+            json.loads(record.message.split("desktop_execution_trace ", 1)[1])
+            for record in caplog.records
+            if record.name == "jarvis2.desktop_execution_trace"
+        ]
+        return pending, result, payloads
+
+    standalone_pending, standalone_result, standalone_payloads = run_action(
+        None, move_foreground=True,
+    )
+    caplog.clear()
+    task_context = {
+        "source": "desktop_task_step",
+        "task_id": "task-trace",
+        "step_id": "step_1",
+        "action_type": "activate_window",
+    }
+    task_pending, task_result, task_payloads = run_action(
+        task_context, move_foreground=False,
+    )
+
+    required_stages = [
+        "ACTIVATE_PREPARE_START", "WINDOW_RESOLVED", "CONFIRMATION_CREATED",
+        "CONFIRM_RECEIVED", "EXECUTE_START", "WINDOW_RELOCATED",
+        "FOREGROUND_BEFORE", "ACTIVATE_METHOD_START", "ACTIVATE_CALLED",
+        "ACTIVATE_RETURNED", "FOREGROUND_IMMEDIATE", "ACTIVATE_METHOD_RESULT",
+        "VERIFY_START", "FOREGROUND_VERIFY", "RESULT",
+    ]
+    common_fields = {
+        "execution_trace_id", "stage", "timestamp", "monotonic_elapsed_ms",
+        "process_id", "thread_id", "thread_name", "event_loop_context",
+        "source", "action_type",
+    }
+
+    for payloads, pending, expected_source in (
+        (standalone_payloads, standalone_pending, "standalone_action"),
+        (task_payloads, task_pending, "desktop_task_step"),
+    ):
+        assert all(common_fields <= payload.keys() for payload in payloads)
+        assert [payload["stage"] for payload in payloads] == required_stages
+        assert len({payload["execution_trace_id"] for payload in payloads}) == 1
+        assert all(payload["source"] == expected_source for payload in payloads)
+        assert all("输入正文" not in json.dumps(payload, ensure_ascii=False)
+                   for payload in payloads)
+        assert all(payload["action_id"] == pending["action_id"]
+                   for payload in payloads if payload["stage"] not in {
+                       "ACTIVATE_PREPARE_START", "WINDOW_RESOLVED",
+                   })
+
+    assert all("task_id" not in payload and "step_id" not in payload
+               for payload in standalone_payloads)
+    assert all(payload["task_id"] == "task-trace" and payload["step_id"] == "step_1"
+               for payload in task_payloads)
+    assert standalone_payloads[1]["target_hwnd"] == 101
+    assert standalone_payloads[5]["target_hwnd"] == 202
+    assert standalone_payloads[6]["foreground_hwnd"] == 100
+    assert standalone_payloads[10]["foreground_hwnd"] == 202
+    assert standalone_result == {
+        "ok": True, "type": "computer_action_result", "computer_action_owned": True,
+        "terminal": True, "action": "activate_window",
+        "action_id": standalone_pending["action_id"], "status": "success", "verified": True,
+        "target": "窗口「无标题 - Notepad」",
+        "verification": {"foreground_hwnd": 202, "expected_hwnd": 202},
+    }
+    failure_result_event = task_payloads[-1]
+    assert task_result["status"] == "failed"
+    assert task_result["error_code"] == "VERIFICATION_FAILED"
+    assert failure_result_event["runtime_state"] == ""
+    assert failure_result_event["expected_hwnd"] == 202
+    assert failure_result_event["actual_foreground_hwnd"] == 100
+    assert failure_result_event["expected_process_id"] == 7
+    assert failure_result_event["actual_foreground_process_id"] == 3
 
 
 def test_text_action_keeps_value_out_of_public_plan_and_runs_after_confirmation(monkeypatch):

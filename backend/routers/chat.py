@@ -16,7 +16,6 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..agent import broker
 from ..brain import answer
 from ..heart import notify
 from ..memory import manager as mem
@@ -35,8 +34,6 @@ class ChatIn(BaseModel):
 def chat_stream(body: ChatIn):
     if not body.question.strip():
         raise HTTPException(400, "问题不能为空")
-    planned_plan = broker.plan_command(body.question)
-
     def gen():
         import time
         from ..db import evals as evals_db
@@ -46,7 +43,7 @@ def chat_stream(body: ChatIn):
         _t0 = time.time()
         try:
             for evt in answer.chat_stream(
-                    body.question, body.conversation_id, planned_plan=planned_plan):
+                    body.question, body.conversation_id):
                 if evt.get("type") == "delta":
                     text_parts.append(str(evt.get("text", "")))
                 yield json.dumps(evt, ensure_ascii=False) + "\n"

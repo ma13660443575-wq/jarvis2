@@ -373,6 +373,70 @@ def test_task_step_http_entrypoint_keeps_binding_and_blocks_legacy_bypass(monkey
     assert payload["data"]["error_code"] == "TASK_CONFIRMATION_REQUIRED"
 
 
+def test_task_text_confirmation_uses_task_owner_and_three_part_binding(monkeypatch):
+    from backend.brain import answer
+
+    started, _prepared, confirmed, _rejected = _start_task(
+        monkeypatch, session_id="session:default",
+    )
+    task_id = started["task_plan"]["task_id"]
+    action_id = started["task_plan"]["action_id"]
+    monkeypatch.setattr(answer, "register_hands", lambda: None)
+    planned_commands: list[str] = []
+    original_plan_command = answer.broker.plan_command
+    monkeypatch.setattr(
+        answer.broker, "plan_command",
+        lambda text, *args, **kwargs: planned_commands.append(text)
+        or original_plan_command(text, *args, **kwargs),
+    )
+    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Task confirmation must not enter Conversation/RAG/Memory/LLM")
+    )
+    monkeypatch.setattr(answer.db.ops, "get_or_create_conversation", forbidden)
+    monkeypatch.setattr(answer.rag, "build_context", forbidden)
+    monkeypatch.setattr(answer.llm, "chat_stream_iter", forbidden)
+    monkeypatch.setattr(answer.llm, "extract_memory_candidates", forbidden)
+
+    events = list(answer.chat_stream("确认"))
+
+    done = next(evt for evt in events if evt.get("type") == "done")
+    assert done["desktop_task_owned"] is True
+    assert done["task_result"]["task_id"] == task_id
+    assert confirmed == [action_id]
+    assert "确认" not in planned_commands
+
+
+def test_task_text_rejection_uses_task_cancellation_owner(monkeypatch):
+    from backend.brain import answer
+
+    started, _prepared, _confirmed, rejected = _start_task(
+        monkeypatch, session_id="session:default",
+    )
+    task_id = started["task_plan"]["task_id"]
+    action_id = started["task_plan"]["action_id"]
+    monkeypatch.setattr(answer, "register_hands", lambda: None)
+    monkeypatch.setattr(
+        answer.broker, "plan_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Task rejection must not be semantically replanned")
+        ),
+    )
+    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("Task rejection must not enter Conversation/RAG/Memory/LLM")
+    )
+    monkeypatch.setattr(answer.db.ops, "get_or_create_conversation", forbidden)
+    monkeypatch.setattr(answer.rag, "build_context", forbidden)
+    monkeypatch.setattr(answer.llm, "chat_stream_iter", forbidden)
+
+    events = list(answer.chat_stream("取消"))
+
+    done = next(evt for evt in events if evt.get("type") == "done")
+    assert done["desktop_task_owned"] is True
+    assert done["task_result"]["task_id"] == task_id
+    assert done["task_result"]["status"] == "CANCELLED"
+    assert rejected == [action_id]
+
+
 
 def test_desktop_task_stream_is_terminal_before_conversation_stack(monkeypatch):
     from backend.brain import answer

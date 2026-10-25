@@ -7,6 +7,7 @@ Runtime 只编排已验证的有限 TaskPlan；桌面动作、确认、重新定
 from __future__ import annotations
 
 import time
+import ntpath
 from typing import Any
 
 from ..computer import actions as computer_actions
@@ -22,6 +23,12 @@ from .task_models import (
     TaskState,
     TaskStateData,
     model_dump,
+)
+from .save_destination import (
+    SaveDestination,
+    SaveDestinationParseResult,
+    SaveDestinationStatus,
+    parse_save_destination,
 )
 from .task_state import TaskStateError, transition_step, transition_task
 from .task_store import store
@@ -41,10 +48,17 @@ _ACTION_TYPES = {
     "click": "click_control",
 }
 _ACTIVE_CONFIRMATION_STATES = {TaskState.WAITING_CONFIRMATION}
+_SAVE_AS_REQUIRED = "SAVE_AS_REQUIRED"
+_WAITING_USER_CANCELS = frozenset({
+    "取消",
+    "取消保存",
+    "不用保存了",
+    "取消这个任务",
+})
 
 
 def _session_id(value: object) -> str:
-    return str(value).strip() if value is not None and str(value).strip() else "chat:default"
+    return str(value).strip() if value is not None and str(value).strip() else "session:default"
 
 
 def ensure_desktop_execution_available(session_id: object = None) -> None:
@@ -62,6 +76,73 @@ def ensure_desktop_execution_available(session_id: object = None) -> None:
                 f"当前 session 已有未结束的 Desktop Task：{active.plan.task_id}",
                 task_result=_result(active),
             )
+
+
+def pending_confirmation_for_session(session_id: object = None) -> dict | None:
+    """返回当前 session 唯一的 Task confirmation，保留既有三元绑定。"""
+    session = _session_id(session_id)
+    with store.locked():
+        record = store.active_for_session(session)
+        if record is None or record.state.status != TaskState.WAITING_CONFIRMATION:
+            return None
+
+        task_id = record.plan.task_id
+        step_id = record.state.current_step_id
+        action_id = record.state.pending_action_id
+        binding = store.action_binding(action_id or "")
+        if not step_id or not action_id or binding != (task_id, step_id):
+            return {
+                "ok": False,
+                "status": "invalid",
+                "error_code": "TASK_ACTION_MISMATCH",
+                "error": "当前 Task confirmation 绑定无效，已拒绝自动执行。",
+                "task_id": task_id,
+                "step_id": step_id,
+                "action_id": action_id,
+                "task_plan": public_plan(record),
+            }
+        return {
+            "ok": True,
+            "status": "waiting_confirmation",
+            "task_id": task_id,
+            "step_id": step_id,
+            "action_id": action_id,
+            "task_plan": public_plan(record),
+        }
+
+
+def waiting_user_for_session(session_id: object = None) -> dict | None:
+    """Return the exact-session WAITING_USER owner without guessing.
+
+    The Store returns all matching records.  More than one match is an
+    invariant violation, so this query fails closed instead of selecting the
+    newest Task.
+    """
+    session = _session_id(session_id)
+    with store.locked():
+        records = store.waiting_user_tasks_for_session(session)
+        if not records:
+            return None
+        if len(records) != 1:
+            return {
+                "ok": False,
+                "status": "invalid",
+                "error_code": "TASK_WAITING_USER_AMBIGUOUS",
+                "error": "当前 session 存在多个等待用户输入的 Desktop Task，已停止自动接管。",
+                "task_id": None,
+                "step_id": None,
+                "task_plan": None,
+            }
+
+        record = records[0]
+        return {
+            "ok": True,
+            "status": "waiting_user",
+            "task_id": record.plan.task_id,
+            "step_id": record.state.current_step_id,
+            "reason": record.state.reason,
+            "task_plan": public_plan(record),
+        }
 
 
 def _task_status_key(state: TaskState) -> str:
@@ -97,6 +178,21 @@ def _step_public(step, result: StepResult | None = None) -> dict[str, Any]:
         }.get(raw.get("action_type"), ""),
         **({key: raw[key] for key in ("error_code", "verified", "action_id", "save_state")
             if key in raw and raw[key]}),
+    }
+
+
+def _public_waiting_user_context(record: TaskRecord) -> dict[str, Any] | None:
+    """Expose only structured continuation metadata, never the raw sentence."""
+    raw = record.context.runtime_metadata.get("waiting_user_context")
+    if not isinstance(raw, dict):
+        return None
+    destination = raw.get("save_destination")
+    return {
+        "reason": str(raw.get("reason") or ""),
+        "source_step_id": str(raw.get("source_step_id") or ""),
+        "business_goal_completed": False,
+        "parse_status": str(raw.get("parse_status") or ""),
+        "save_destination": destination if isinstance(destination, dict) else None,
     }
 
 
@@ -142,6 +238,9 @@ def public_plan(record: TaskRecord) -> dict[str, Any]:
     )
     if latest_result is not None and latest_result.save_state:
         out["save_state"] = latest_result.save_state
+    waiting_user_context = _public_waiting_user_context(record)
+    if waiting_user_context is not None:
+        out["waiting_user_context"] = waiting_user_context
     return out
 
 
@@ -226,6 +325,7 @@ def _prepare_current(record: TaskRecord) -> None:
         "task_id": record.plan.task_id,
         "step_id": step.step_id,
         "action_type": action_plan.get("action"),
+        "session_id": record.context.session_id,
     }
     with computer_actions.execution_trace_context(trace_context):
         pending = computer_actions.create_pending_action(action_plan, command)
@@ -351,6 +451,86 @@ def _safe_action_result(action_result: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _set_waiting_user_context(
+    record: TaskRecord,
+    *,
+    destination: SaveDestination | None = None,
+    parse_status: SaveDestinationStatus | str | None = None,
+) -> None:
+    """Store structured Save-As continuation state in TaskContext only."""
+    source_step_id = record.state.current_step_id or ""
+    status = parse_status.value if isinstance(parse_status, SaveDestinationStatus) else str(parse_status or "")
+    record.context.runtime_metadata["waiting_user_context"] = {
+        "reason": _SAVE_AS_REQUIRED,
+        "source_step_id": source_step_id,
+        "business_goal_completed": False,
+        "parse_status": status,
+        "save_destination": destination.to_dict() if destination is not None else None,
+    }
+
+
+def _destination_from_metadata(value: object) -> SaveDestination | None:
+    if not isinstance(value, dict):
+        return None
+    if not any(key in value for key in ("directory", "filename", "full_path", "source_kind")):
+        return None
+    return SaveDestination(
+        directory=value.get("directory"),
+        filename=value.get("filename"),
+        full_path=value.get("full_path"),
+        source_kind=str(value.get("source_kind") or ""),
+        overwrite_policy=str(value.get("overwrite_policy") or "deny_or_confirm"),
+    )
+
+
+def _merge_waiting_user_destination(
+    record: TaskRecord,
+    parsed: SaveDestinationParseResult,
+) -> SaveDestination | None:
+    """Complete a previously captured directory with a later filename-only turn."""
+    destination = parsed.destination
+    if destination is None or destination.source_kind != "filename_only":
+        return destination
+    waiting = record.context.runtime_metadata.get("waiting_user_context")
+    previous = _destination_from_metadata(waiting.get("save_destination") if isinstance(waiting, dict) else None)
+    if previous is None or not previous.directory or previous.filename:
+        return destination
+
+    full_path = None
+    if previous.source_kind == "absolute_path":
+        full_path = ntpath.join(previous.directory, destination.filename or "")
+    return SaveDestination(
+        directory=previous.directory,
+        filename=destination.filename,
+        full_path=full_path,
+        source_kind=previous.source_kind,
+        overwrite_policy=previous.overwrite_policy,
+    )
+
+
+def _normalized_waiting_input(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.strip().split()).casefold()
+
+
+def _waiting_user_message(
+    question: str,
+    parsed: SaveDestinationParseResult,
+    destination: SaveDestination | None,
+) -> str:
+    if parsed.status == SaveDestinationStatus.PARSED and destination is not None:
+        return f"已记录保存目标：{destination.display_label()}。下一步需要执行文件保存操作。"
+    if parsed.status == SaveDestinationStatus.INCOMPLETE and destination is not None:
+        return f"已识别保存位置：{destination.display_label()}；还需要文件名。"
+    if parsed.status == SaveDestinationStatus.INVALID:
+        detail = parsed.reason or "保存目标格式无效"
+        return f"保存目标无效：{detail}。请提供保存位置或文件名，或发送“取消保存”。"
+    if _normalized_waiting_input(question) == "确认":
+        return "当前还需要保存位置或文件名。"
+    return "当前任务正在等待保存位置或文件名；请提供保存目标，或发送“取消保存”。"
+
+
 def _finish_after_success(record: TaskRecord, step, result: StepResult,
                           action_result: dict[str, Any]) -> None:
     record.state.pending_action_id = None
@@ -359,7 +539,9 @@ def _finish_after_success(record: TaskRecord, step, result: StepResult,
     save_state = action_result.get("save_state")
     if save_state == "SAVE_AS_REQUIRED" or business_goal_completed is False:
         record.state.business_goal_completed = False
-        record.state.reason = "SAVE_AS_REQUIRED" if save_state == "SAVE_AS_REQUIRED" else "USER_INPUT_REQUIRED"
+        record.state.reason = _SAVE_AS_REQUIRED if save_state == _SAVE_AS_REQUIRED else "USER_INPUT_REQUIRED"
+        if record.state.reason == _SAVE_AS_REQUIRED:
+            _set_waiting_user_context(record)
         _transition_task(record, TaskState.WAITING_USER)
         return
 
@@ -373,6 +555,71 @@ def _finish_after_success(record: TaskRecord, step, result: StepResult,
 
     record.state.current_step_id = next_step.step_id
     _prepare_current(record)
+
+
+def handle_waiting_user_input(task_id: str, session_id: object, question: str) -> dict[str, Any]:
+    """Consume only a supported WAITING_USER continuation.
+
+    Phase A supports SAVE_AS_REQUIRED only.  It records a structured
+    destination or cancellation and deliberately leaves file-dialog execution
+    for a later phase.
+    """
+    session = _session_id(session_id)
+    with store.locked():
+        record = store.get(task_id)
+        if record is None:
+            raise TaskRuntimeError("TASK_NOT_FOUND", "Task 不存在")
+        if record.context.session_id != session:
+            raise TaskRuntimeError("TASK_SESSION_MISMATCH", "Task 不属于当前 session")
+        if record.state.status != TaskState.WAITING_USER:
+            raise TaskRuntimeError("TASK_NOT_WAITING_USER", "Task 当前不在等待用户输入状态")
+
+        if _normalized_waiting_input(question) in _WAITING_USER_CANCELS:
+            record.state.business_goal_completed = False
+            record.state.error_code = "SAVE_CANCELLED"
+            record.state.reason = "SAVE_CANCELLED"
+            record.context.runtime_metadata.pop("waiting_user_context", None)
+            _transition_task(record, TaskState.CANCELLED)
+            _skip_remaining(record)
+            return {
+                "ok": True,
+                "status": "cancelled",
+                "consumed": True,
+                "parse_status": "CANCELLED",
+                "message": "Task 已取消；Windows Save-As 对话框的 UI 关闭将在 Phase B 接入。",
+                "task_plan": public_plan(record),
+                "task_result": _result(record).to_dict(),
+            }
+
+        if record.state.reason != _SAVE_AS_REQUIRED:
+            return {
+                "ok": True,
+                "status": "waiting_user",
+                "consumed": True,
+                "parse_status": SaveDestinationStatus.NOT_RELEVANT.value,
+                "message": "当前 Task 正在等待用户输入，但此等待原因暂不支持该 continuation。",
+                "task_plan": public_plan(record),
+                "task_result": _result(record).to_dict(),
+            }
+
+        parsed = parse_save_destination(question)
+        destination = _merge_waiting_user_destination(record, parsed)
+        if parsed.status in {SaveDestinationStatus.PARSED, SaveDestinationStatus.INCOMPLETE}:
+            _set_waiting_user_context(
+                record,
+                destination=destination,
+                parse_status=parsed.status,
+            )
+
+        return {
+            "ok": True,
+            "status": "waiting_user",
+            "consumed": True,
+            "parse_status": parsed.status.value,
+            "message": _waiting_user_message(question, parsed, destination),
+            "task_plan": public_plan(record),
+            "task_result": _result(record).to_dict(),
+        }
 
 
 def confirm_step(task_id: str, step_id: str, action_id: str) -> dict[str, Any]:
